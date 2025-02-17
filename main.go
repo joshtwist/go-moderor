@@ -171,6 +171,13 @@ func main() {
 		activeServers = append(activeServers, server)
 	}
 
+	// Log the broadcast servers at startup and warn if none found.
+	if len(activeServers) == 0 {
+		log.Printf("WARNING: No broadcast servers found in config. Peer updates will not be sent.")
+	} else {
+		log.Printf("Broadcast servers: %v", activeServers)
+	}
+
 	// Start the background publishing loop.
 	go publishUpdatesLoop()
 
