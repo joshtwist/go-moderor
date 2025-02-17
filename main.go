@@ -157,21 +157,18 @@ func main() {
 		log.Fatalf("Error parsing config file: %v", err)
 	}
 
-	// Build activeServers: filter out the current instance.
+	// Use all configured servers.
 	for _, server := range config.BroadcastServers {
 		parsed, err := url.Parse(server)
 		if err != nil {
 			log.Printf("Error parsing server URL %s: %v", server, err)
 			continue
 		}
-		// If the port in the URL equals our current port, skip it.
-		if parsed.Port() == strconv.Itoa(currentPort) {
-			continue
-		}
-		activeServers = append(activeServers, server)
+		// Instead of filtering by port, simply add the server.
+		activeServers = append(activeServers, parsed.String())
 	}
 
-	// Log the broadcast servers at startup and warn if none found.
+	// Log the broadcast servers at startup and warn if none are found.
 	if len(activeServers) == 0 {
 		log.Printf("WARNING: No broadcast servers found in config. Peer updates will not be sent.")
 	} else {
