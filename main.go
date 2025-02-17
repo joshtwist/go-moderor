@@ -92,16 +92,20 @@ func (m *InstrMutex) Unlock() {
 	m.mu.Unlock()
 }
 
-// --------------------- Global Variables & Instrumented Locks ---------------------
+// --------------------- Global Variables ---------------------
+
+// KeyRecord wraps KeyData with a per-key mutex.
+type KeyRecord struct {
+	mu   sync.Mutex
+	data *KeyData
+}
 
 var (
-	// Data map and its instrumented mutex.
-	data      = make(map[string]*KeyData)
-	dataMutex = &InstrRWMutex{}
+	// dataStore holds key records in a thread-safe manner.
+	dataStore sync.Map // key: string -> *KeyRecord
 
-	// publishList is used as a set of keyIds that were updated.
-	publishList      = make(map[string]struct{})
-	publishListMutex = &InstrMutex{}
+	// publishSet holds keys pending publication.
+	publishSet sync.Map // key: string -> bool
 
 	// postUpdateQueues maps a port to a NodeUpdatePatch update queue.
 	postUpdateQueues      = make(map[int]NodeUpdatePatch)
@@ -165,14 +169,17 @@ func main() {
 // GET "/" returns the full data as JSON.
 func handleRoot(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&totalRequests, 1)
-	dataMutex.RLock()
-	defer dataMutex.RUnlock()
 
-	// Copy data to avoid race conditions during JSON encoding.
+	// Build a copy of all keys by iterating dataStore.
 	copyData := make(map[string]KeyData)
-	for k, v := range data {
-		copyData[k] = *v
-	}
+	dataStore.Range(func(key, value interface{}) bool {
+		rec := value.(*KeyRecord)
+		// Eventually consistent read: no locking performed.
+		if rec.data != nil {
+			copyData[key.(string)] = *rec.data
+		}
+		return true
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(copyData)
@@ -186,25 +193,24 @@ func handleGetKey(w http.ResponseWriter, r *http.Request) {
 	keyId := vars["keyId"]
 	now := time.Now().UnixMilli()
 
-	dataMutex.RLock()
-	key, exists := data[keyId]
-	dataMutex.RUnlock()
-
-	if !exists || key.Expires < now {
-		// If expired, remove it.
-		if exists {
-			dataMutex.Lock()
-			delete(data, keyId)
-			dataMutex.Unlock()
-		}
+	recVal, exists := dataStore.Load(keyId)
+	if !exists {
 		w.Header().Set("Content-Type", "application/json")
-		// Return null (encoded as JSON null).
+		json.NewEncoder(w).Encode(nil)
+		return
+	}
+
+	rec := recVal.(*KeyRecord)
+	// Eventually consistent read: read without locking.
+	if rec.data == nil || rec.data.Expires < now {
+		dataStore.Delete(keyId)
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(nil)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(key)
+	json.NewEncoder(w).Encode(rec.data)
 }
 
 // PATCH "/keys/{keyId}" updates a key based on the provided increment and TTL.
@@ -222,29 +228,41 @@ func handlePatchKey(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UnixMilli()
 
-	dataMutex.Lock()
-	key, exists := data[keyId]
-	if !exists || key.Expires < now {
-		// Create a new key record if it does not exist or is expired.
-		key = &KeyData{
+	// Load or create the per-key record.
+	recVal, exists := dataStore.Load(keyId)
+	var rec *KeyRecord
+	if !exists {
+		newRec := &KeyRecord{
+			data: &KeyData{
+				Value:            0,
+				Expires:          now + int64(patch.TTLSeconds)*1000,
+				UnpublishedDelta: 0,
+			},
+		}
+		actual, _ := dataStore.LoadOrStore(keyId, newRec)
+		rec = actual.(*KeyRecord)
+	} else {
+		rec = recVal.(*KeyRecord)
+	}
+
+	// Lock the record while updating.
+	rec.mu.Lock()
+	if rec.data == nil || rec.data.Expires < now {
+		rec.data = &KeyData{
 			Value:            0,
 			Expires:          now + int64(patch.TTLSeconds)*1000,
 			UnpublishedDelta: 0,
 		}
-		data[keyId] = key
 	}
-	// Update the key with the increment.
-	key.Value += patch.Increment
-	key.UnpublishedDelta += patch.Increment
-	dataMutex.Unlock()
+	rec.data.Value += patch.Increment
+	rec.data.UnpublishedDelta += patch.Increment
+	rec.mu.Unlock()
 
 	// Mark this key for publishing.
-	publishListMutex.Lock()
-	publishList[keyId] = struct{}{}
-	publishListMutex.Unlock()
+	publishSet.Store(keyId, true)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(key)
+	json.NewEncoder(w).Encode(rec.data)
 }
 
 // POST "/node-update" applies node update patches from other servers.
@@ -257,49 +275,47 @@ func handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Removed verbose logging to reduce overhead.
-	// log.Printf("Received node-update: %+v", patch)
 	now := time.Now().UnixMilli()
 
-	dataMutex.Lock()
 	for keyId, update := range patch {
 		if update.Expires < now {
-			// Skipping expired update.
 			continue
 		}
 
-		key, exists := data[keyId]
-		if exists && key.Expires < now {
-			// Key expired; treat as not found.
-			exists = false
-			key = nil
-		}
-
-		// Adjust expiry if necessary.
-		if exists && key.Expires != update.Expires {
-			if key.Expires > update.Expires {
-				key.Expires = update.Expires
-			}
-		}
-
+		recVal, exists := dataStore.Load(keyId)
+		var rec *KeyRecord
 		if !exists {
-			// Creating new record.
-			key = &KeyData{
+			newRec := &KeyRecord{
+				data: &KeyData{
+					Value:            update.CurrentServerCount,
+					Expires:          update.Expires,
+					UnpublishedDelta: 0,
+				},
+			}
+			actual, _ := dataStore.LoadOrStore(keyId, newRec)
+			rec = actual.(*KeyRecord)
+		} else {
+			rec = recVal.(*KeyRecord)
+		}
+
+		rec.mu.Lock()
+		if rec.data == nil || rec.data.Expires < now {
+			rec.data = &KeyData{
 				Value:            update.CurrentServerCount,
 				Expires:          update.Expires,
 				UnpublishedDelta: 0,
 			}
-			data[keyId] = key
 		} else {
-			key.Value += update.Delta
-			// If this server fell behind, take the upper value.
-			if key.Value < update.CurrentServerCount {
-				key.Value = update.CurrentServerCount
+			if rec.data.Expires > update.Expires {
+				rec.data.Expires = update.Expires
 			}
-			// Updating existing record.
+			rec.data.Value += update.Delta
+			if rec.data.Value < update.CurrentServerCount {
+				rec.data.Value = update.CurrentServerCount
+			}
 		}
+		rec.mu.Unlock()
 	}
-	dataMutex.Unlock()
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte("OK"))
@@ -316,26 +332,26 @@ func publishUpdatesLoop() {
 		now := time.Now().UnixMilli()
 		updates := make(NodeUpdatePatch)
 
-		// Lock data and publishList to build updates.
-		dataMutex.Lock()
-		publishListMutex.Lock()
-		for keyId := range publishList {
-			key, exists := data[keyId]
-			if !exists || key.Expires < now {
-				continue
+		// Build updates from the publishSet.
+		publishSet.Range(func(key, _ interface{}) bool {
+			keyId := key.(string)
+			recVal, exists := dataStore.Load(keyId)
+			if exists {
+				rec := recVal.(*KeyRecord)
+				rec.mu.Lock()
+				if rec.data != nil && rec.data.Expires >= now {
+					updates[keyId] = NodeUpdateRecord{
+						CurrentServerCount: rec.data.Value,
+						Delta:              rec.data.UnpublishedDelta,
+						Expires:            rec.data.Expires,
+					}
+					rec.data.UnpublishedDelta = 0
+				}
+				rec.mu.Unlock()
 			}
-			updates[keyId] = NodeUpdateRecord{
-				CurrentServerCount: key.Value,
-				Delta:              key.UnpublishedDelta,
-				Expires:            key.Expires,
-			}
-			// Reset the unpublished delta after queuing.
-			key.UnpublishedDelta = 0
-		}
-		// Clear the publish list.
-		publishList = make(map[string]struct{})
-		publishListMutex.Unlock()
-		dataMutex.Unlock()
+			publishSet.Delete(key)
+			return true
+		})
 
 		// Merge these updates into the per-port update queues.
 		postUpdateQueuesMutex.Lock()
@@ -458,15 +474,19 @@ func heartbeat() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Get a snapshot of the number of keys.
-		dataMutex.RLock()
-		dataCount := len(data)
-		dataMutex.RUnlock()
+		// Count keys in dataStore.
+		dataCount := 0
+		dataStore.Range(func(_, _ interface{}) bool {
+			dataCount++
+			return true
+		})
 
-		// Get the size of the publish list.
-		publishListMutex.Lock()
-		publishCount := len(publishList)
-		publishListMutex.Unlock()
+		// Count keys in publishSet.
+		publishCount := 0
+		publishSet.Range(func(_, _ interface{}) bool {
+			publishCount++
+			return true
+		})
 
 		// Summarize the update queues.
 		postUpdateQueuesMutex.Lock()
@@ -476,21 +496,12 @@ func heartbeat() {
 		}
 		postUpdateQueuesMutex.Unlock()
 
-		// Read instrumented lock metrics.
-		dataAcq := atomic.LoadInt64(&dataMutex.totalAcquisitions)
-		dataWait := atomic.LoadInt64(&dataMutex.waitCount)
-		plAcq := atomic.LoadInt64(&publishListMutex.totalAcquisitions)
-		plWait := atomic.LoadInt64(&publishListMutex.waitCount)
-		puqAcq := atomic.LoadInt64(&postUpdateQueuesMutex.totalAcquisitions)
-		puqWait := atomic.LoadInt64(&postUpdateQueuesMutex.waitCount)
-
 		totalReq := atomic.LoadInt64(&totalRequests)
 		getReq := atomic.LoadInt64(&totalKeyGetRequests)
 		patchReq := atomic.LoadInt64(&totalKeyPatchRequests)
 		nodeUpdateReq := atomic.LoadInt64(&totalNodeUpdateRequests)
 
-		log.Printf("HEARTBEAT: keys=%d, publishList=%d, updateQueues={%s}, totalReq=%d (get:%d, patch:%d, nodeUpdate:%d) | Locks: data(acq:%d, wait:%d), publish(acq:%d, wait:%d), updateQueues(acq:%d, wait:%d)",
-			dataCount, publishCount, updateQueueInfo, totalReq, getReq, patchReq, nodeUpdateReq,
-			dataAcq, dataWait, plAcq, plWait, puqAcq, puqWait)
+		log.Printf("HEARTBEAT: keys=%d, publishSet=%d, updateQueues={%s}, totalReq=%d (get:%d, patch:%d, nodeUpdate:%d)",
+			dataCount, publishCount, updateQueueInfo, totalReq, getReq, patchReq, nodeUpdateReq)
 	}
 }
