@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"gopkg.in/yaml.v3"
 )
 
 // --------------------- Data Structures ---------------------
@@ -107,15 +109,12 @@ var (
 	// publishSet holds keys pending publication.
 	publishSet sync.Map // key: string -> bool
 
-	// postUpdateQueues maps a port to a NodeUpdatePatch update queue.
-	postUpdateQueues      = make(map[int]NodeUpdatePatch)
+	// postUpdateQueues maps a server URL to a NodeUpdatePatch update queue.
+	postUpdateQueues      = make(map[string]NodeUpdatePatch)
 	postUpdateQueuesMutex = &InstrMutex{}
 
-	// Define the complete port list.
-	portList = []int{8000, 8001, 8002}
-
-	// Will hold the list of ports excluding the current one.
-	activePortList []int
+	// activeServers will hold broadcast server URLs other than this server.
+	activeServers []string
 
 	// The port on which this server is running.
 	currentPort int
@@ -126,6 +125,11 @@ var (
 	totalKeyPatchRequests   int64
 	totalNodeUpdateRequests int64
 )
+
+// Config holds configuration loaded from file.
+type Config struct {
+	BroadcastServers []string `yaml:"broadcastServers"`
+}
 
 func main() {
 	// Parse the command-line argument for port. Default to 8000 if not provided.
@@ -139,11 +143,28 @@ func main() {
 		currentPort = p
 	}
 
-	// Build activePortList (all ports except currentPort).
-	for _, p := range portList {
-		if p != currentPort {
-			activePortList = append(activePortList, p)
+	// Load configuration file "config.yaml" from the same folder.
+	configData, err := os.ReadFile("config.yaml")
+	if err != nil {
+		log.Fatalf("Error reading config file: %v", err)
+	}
+	var config Config
+	if err := yaml.Unmarshal(configData, &config); err != nil {
+		log.Fatalf("Error parsing config file: %v", err)
+	}
+
+	// Build activeServers: filter out the current instance.
+	for _, server := range config.BroadcastServers {
+		parsed, err := url.Parse(server)
+		if err != nil {
+			log.Printf("Error parsing server URL %s: %v", server, err)
+			continue
 		}
+		// If the port in the URL equals our current port, skip it.
+		if parsed.Port() == strconv.Itoa(currentPort) {
+			continue
+		}
+		activeServers = append(activeServers, server)
 	}
 
 	// Start the background publishing loop.
@@ -353,45 +374,45 @@ func publishUpdatesLoop() {
 			return true
 		})
 
-		// Merge these updates into the per-port update queues.
+		// Merge these updates into the per-server update queues.
 		postUpdateQueuesMutex.Lock()
-		for _, p := range activePortList {
-			existing := postUpdateQueues[p]
+		for _, server := range activeServers {
+			existing := postUpdateQueues[server]
 			merged := mergeNodeUpdates(existing, updates)
-			postUpdateQueues[p] = merged
+			postUpdateQueues[server] = merged
 		}
 		postUpdateQueuesMutex.Unlock()
 
-		// Attempt to send the queued updates for each active port.
-		for _, p := range activePortList {
-			go func(port int) {
+		// Attempt to send the queued updates for each active server.
+		for _, server := range activeServers {
+			go func(target string) {
 				postUpdateQueuesMutex.Lock()
-				update, exists := postUpdateQueues[port]
+				update, exists := postUpdateQueues[target]
 				if !exists || len(update) == 0 {
 					postUpdateQueuesMutex.Unlock()
 					return
 				}
 				postUpdateQueuesMutex.Unlock()
 
-				if err := postUpdates(port, update); err != nil {
-					log.Printf("Error Publishing to Server '%d':\n%s", port, err.Error())
+				if err := postUpdates(target, update); err != nil {
+					log.Printf("Error Publishing to Server '%s':\n%s", target, err.Error())
 					// Do not clear the queue so that updates are retried.
 					return
 				}
-				// On successful post, clear the update queue for that port.
+				// On successful post, clear the update queue for that server.
 				postUpdateQueuesMutex.Lock()
-				postUpdateQueues[port] = make(NodeUpdatePatch)
+				postUpdateQueues[target] = make(NodeUpdatePatch)
 				postUpdateQueuesMutex.Unlock()
-			}(p)
+			}(server)
 		}
 	}
 }
 
-// postUpdates sends a node-update patch to a specific port.
-func postUpdates(port int, updates NodeUpdatePatch) error {
+// postUpdates sends a node-update patch to a specific server.
+func postUpdates(target string, updates NodeUpdatePatch) error {
 	// Removed verbose logging; errors are still logged.
-	// log.Printf("Publishing node-update to '%d'", port)
-	url := "http://localhost:" + strconv.Itoa(port) + "/node-update"
+	// Build the URL by appending "/node-update" to the target server.
+	url := fmt.Sprintf("%s/node-update", target)
 
 	bodyBytes, err := json.Marshal(updates)
 	if err != nil {
@@ -491,8 +512,8 @@ func heartbeat() {
 		// Summarize the update queues.
 		postUpdateQueuesMutex.Lock()
 		updateQueueInfo := ""
-		for port, patch := range postUpdateQueues {
-			updateQueueInfo += fmt.Sprintf(" %d:%d", port, len(patch))
+		for server, patch := range postUpdateQueues {
+			updateQueueInfo += fmt.Sprintf(" %s:%d", server, len(patch))
 		}
 		postUpdateQueuesMutex.Unlock()
 
