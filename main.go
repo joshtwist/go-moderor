@@ -124,6 +124,10 @@ var (
 	totalKeyGetRequests     int64
 	totalKeyPatchRequests   int64
 	totalNodeUpdateRequests int64
+
+	// Additional metrics for node update attempts and successfully sent updates.
+	totalUpdateAttempts int64
+	totalUpdateSent     int64
 )
 
 // Config holds configuration loaded from file.
@@ -394,11 +398,17 @@ func publishUpdatesLoop() {
 				}
 				postUpdateQueuesMutex.Unlock()
 
+				// Count an update attempt.
+				atomic.AddInt64(&totalUpdateAttempts, 1)
+
 				if err := postUpdates(target, update); err != nil {
 					log.Printf("Error Publishing to Server '%s':\n%s", target, err.Error())
 					// Do not clear the queue so that updates are retried.
 					return
 				}
+				// Count a successful update sent.
+				atomic.AddInt64(&totalUpdateSent, 1)
+
 				// On successful post, clear the update queue for that server.
 				postUpdateQueuesMutex.Lock()
 				postUpdateQueues[target] = make(NodeUpdatePatch)
@@ -521,8 +531,10 @@ func heartbeat() {
 		getReq := atomic.LoadInt64(&totalKeyGetRequests)
 		patchReq := atomic.LoadInt64(&totalKeyPatchRequests)
 		nodeUpdateReq := atomic.LoadInt64(&totalNodeUpdateRequests)
+		updateAttempts := atomic.LoadInt64(&totalUpdateAttempts)
+		updateSent := atomic.LoadInt64(&totalUpdateSent)
 
-		log.Printf("HEARTBEAT: keys=%d, publishSet=%d, updateQueues={%s}, totalReq=%d (get:%d, patch:%d, nodeUpdate:%d)",
-			dataCount, publishCount, updateQueueInfo, totalReq, getReq, patchReq, nodeUpdateReq)
+		log.Printf("HEARTBEAT: keys=%d, publishSet=%d, updateQueues={%s}, totalReq=%d (get:%d, patch:%d, nodeUpdate(recv):%d, updateAttempts:%d, updateSent:%d)",
+			dataCount, publishCount, updateQueueInfo, totalReq, getReq, patchReq, nodeUpdateReq, updateAttempts, updateSent)
 	}
 }
